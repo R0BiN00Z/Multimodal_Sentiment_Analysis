@@ -1,63 +1,54 @@
 import torch
 import torch.nn as nn
-from transformers import AutoModel, AutoTokenizer
 
-class MultimodalModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
+class BimodalSentimentModel(nn.Module):
+    def __init__(self, text_input_size, audio_input_size, hidden_size, num_classes, dropout=0.1):
+        super(BimodalSentimentModel, self).__init__()
         
-        # Text encoder
-        self.text_encoder = AutoModel.from_pretrained(config.text_model_name)
-        self.text_tokenizer = AutoTokenizer.from_pretrained(config.text_model_name)
+        # Text feature processing
+        self.text_fc = nn.Linear(text_input_size, hidden_size)
+        self.text_bn = nn.BatchNorm1d(hidden_size)
         
-        # Acoustic encoder
-        self.acoustic_encoder = nn.Sequential(
-            nn.Linear(config.acoustic_input_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.hidden_dim)
-        )
-        
-        # Visual encoder
-        self.visual_encoder = nn.Sequential(
-            nn.Linear(config.visual_input_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.hidden_dim, config.hidden_dim)
-        )
+        # Audio feature processing
+        self.audio_fc = nn.Linear(audio_input_size, hidden_size)
+        self.audio_bn = nn.BatchNorm1d(hidden_size)
         
         # Fusion layer
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(config.hidden_dim * 3, config.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(config.dropout)
-        )
+        self.fusion = nn.Linear(hidden_size * 2, hidden_size)
+        self.fusion_bn = nn.BatchNorm1d(hidden_size)
         
         # Classifier
-        self.classifier = nn.Linear(config.hidden_dim, config.num_labels)
+        self.classifier = nn.Linear(hidden_size, num_classes)
         
-    def forward(self, text_inputs, acoustic_features, visual_features):
-        # Text encoding
-        text_outputs = self.text_encoder(**text_inputs)
-        text_embeddings = text_outputs.last_hidden_state.mean(dim=1)
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
         
-        # Acoustic encoding
-        acoustic_embeddings = self.acoustic_encoder(acoustic_features)
+        # Activation
+        self.relu = nn.ReLU()
         
-        # Visual encoding
-        visual_embeddings = self.visual_encoder(visual_features)
+    def forward(self, text, audio):
+        # Process text features
+        text_features = self.text_fc(text)
+        text_features = self.text_bn(text_features)
+        text_features = self.relu(text_features)
+        text_features = self.dropout(text_features)
         
-        # Feature fusion
-        fused_features = torch.cat([
-            text_embeddings,
-            acoustic_embeddings,
-            visual_embeddings
-        ], dim=1)
+        # Process audio features
+        audio_features = self.audio_fc(audio)
+        audio_features = self.audio_bn(audio_features)
+        audio_features = self.relu(audio_features)
+        audio_features = self.dropout(audio_features)
         
-        fused_features = self.fusion_layer(fused_features)
+        # Concatenate features
+        combined = torch.cat([text_features, audio_features], dim=1)
+        
+        # Fusion
+        fused = self.fusion(combined)
+        fused = self.fusion_bn(fused)
+        fused = self.relu(fused)
+        fused = self.dropout(fused)
         
         # Classification
-        logits = self.classifier(fused_features)
+        output = self.classifier(fused)
         
-        return logits 
+        return output 
