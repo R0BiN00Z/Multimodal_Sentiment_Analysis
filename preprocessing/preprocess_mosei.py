@@ -1,155 +1,81 @@
 import os
 import numpy as np
-import torch
 from mmsdk import mmdatasdk
 from tqdm import tqdm
 
-class MOSEIPreprocessor:
-    def __init__(self, data_dir):
-        """
-        Initialize the MOSEI preprocessor
-        
-        Args:
-            data_dir (str): Directory containing the CMU-MOSEI dataset
-        """
-        self.data_dir = data_dir
-        self.aligned_dir = os.path.join(data_dir, "aligned")
-        os.makedirs(self.aligned_dir, exist_ok=True)
-        
-        # Define feature files
-        self.csd_files = {
-            'glove_vectors': 'CMU_MOSEI_TimestampedWordVectors.csd',
-            'COVAREP': 'CMU_MOSEI_COVAREP.csd',
-            'OpenFace_2': 'CMU_MOSEI_VisualOpenFace2.csd',
-            'FACET 4.2': 'CMU_MOSEI_VisualFacet42.csd',
-            'All Labels': 'CMU_MOSEI_Labels.csd'
-        }
-        
-    def load_dataset(self):
-        """Load the CMU-MOSEI dataset"""
-        print("Loading CMU-MOSEI dataset...")
-        
-        # Create recipe dictionary
-        recipe = {}
-        for key, filename in self.csd_files.items():
-            file_path = os.path.join(self.data_dir, filename)
-            if os.path.exists(file_path):
-                recipe[key] = file_path
-            else:
-                raise FileNotFoundError(f"Missing file: {filename}")
-        
-        # Load dataset
-        dataset = mmdatasdk.mmdataset(recipe)
-        print("Dataset loaded successfully!")
-        return dataset
+def download_and_align():
+    # 设置数据目录
+    DATA_DIR = "data/CMU_MOSEI"
+    ALIGNED_DIR = os.path.join(DATA_DIR, "aligned")
+    os.makedirs(ALIGNED_DIR, exist_ok=True)
     
-    def align_features(self, dataset):
-        """Align features using 'All Labels' as the alignment key"""
-        print("Aligning features...")
-        
-        try:
-            # Align features
-            dataset.align('All Labels', collapse_functions=[np.mean])
-            print("Features aligned successfully!")
-            return dataset
-        except Exception as e:
-            print(f"Error during alignment: {str(e)}")
-            raise
+    # 只下载文本和音频特征
+    csd_files = {
+        'glove_vectors': 'CMU_MOSEI_TimestampedWordVectors.csd',
+        'COVAREP': 'CMU_MOSEI_COVAREP.csd',
+        'All Labels': 'CMU_MOSEI_Labels.csd'
+    }
     
-    def extract_features(self, dataset):
-        """Extract features from the aligned dataset"""
-        print("Extracting features...")
-        
-        features = {
-            'text': [],
-            'audio': [],
-            'visual': [],
-            'labels': []
-        }
-        
-        # Get computational sequences
-        text_seq = dataset.computational_sequences['glove_vectors']
-        audio_seq = dataset.computational_sequences['COVAREP']
-        visual_seq = dataset.computational_sequences['OpenFace_2']
-        label_seq = dataset.computational_sequences['All Labels']
-        
-        # Extract features for each video
-        for video_id in tqdm(dataset.computational_sequences['All Labels'].keys()):
-            try:
-                # Extract text features
-                text_data = text_seq[video_id]['features']
-                text_features = np.mean(text_data, axis=0)
-                
-                # Extract audio features
-                audio_data = audio_seq[video_id]['features']
-                audio_features = np.mean(audio_data, axis=0)
-                
-                # Extract visual features
-                visual_data = visual_seq[video_id]['features']
-                visual_features = np.mean(visual_data, axis=0)
-                
-                # Extract labels
-                label_data = label_seq[video_id]['features']
-                labels = np.mean(label_data, axis=0)
-                
-                # Store features
-                features['text'].append(text_features)
-                features['audio'].append(audio_features)
-                features['visual'].append(visual_features)
-                features['labels'].append(labels)
-                
-            except Exception as e:
-                print(f"Error processing video {video_id}: {str(e)}")
-                continue
-        
-        # Convert to numpy arrays
-        for key in features:
-            features[key] = np.array(features[key])
-        
-        return features
+    # 检查文件是否已存在
+    missing_files = []
+    for key, filename in csd_files.items():
+        filepath = os.path.join(DATA_DIR, filename)
+        if not os.path.exists(filepath):
+            missing_files.append((key, filename))
     
-    def save_features(self, features, output_dir):
-        """Save extracted features to disk"""
-        print("Saving features...")
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Save each feature type
-        for key, data in features.items():
-            output_path = os.path.join(output_dir, f"{key}_features.npy")
-            np.save(output_path, data)
-            print(f"Saved {key} features to {output_path}")
+    if missing_files:
+        print("开始下载缺失的文件...")
+        for key, filename in missing_files:
+            print(f"下载 {filename}...")
+            url = f"http://immortal.multicomp.cs.cmu.edu/CMU-MOSEI/language/{filename}" if key == 'glove_vectors' else \
+                  f"http://immortal.multicomp.cs.cmu.edu/CMU-MOSEI/acoustic/{filename}" if key == 'COVAREP' else \
+                  f"http://immortal.multicomp.cs.cmu.edu/CMU-MOSEI/labels/{filename}"
+            os.system(f"wget {url} -P {DATA_DIR}")
     
-    def preprocess(self):
-        """Main preprocessing pipeline"""
-        try:
-            # Load dataset
-            dataset = self.load_dataset()
+    # 加载数据集
+    print("加载数据集...")
+    recipe = {
+        'glove_vectors': os.path.join(DATA_DIR, csd_files['glove_vectors']),
+        'COVAREP': os.path.join(DATA_DIR, csd_files['COVAREP']),
+        'All Labels': os.path.join(DATA_DIR, csd_files['All Labels'])
+    }
+    
+    dataset = mmdatasdk.mmdataset(recipe)
+    
+    # 对齐特征
+    print("对齐特征...")
+    dataset.align('All Labels', collapse_functions=[np.mean])
+    
+    # 保存对齐后的特征
+    print("保存对齐后的特征...")
+    splits = ['train', 'valid', 'test']
+    for split in splits:
+        print(f"处理 {split} 集...")
+        split_data = dataset.computational_sequences['All Labels'].data[split]
+        
+        text_features = []
+        audio_features = []
+        labels = []
+        
+        for vid, data in tqdm(split_data.items()):
+            # 获取文本特征
+            text = dataset.computational_sequences['glove_vectors'].data[split][vid]['features']
+            text_features.append(text)
             
-            # Align features
-            aligned_dataset = self.align_features(dataset)
+            # 获取音频特征
+            audio = dataset.computational_sequences['COVAREP'].data[split][vid]['features']
+            audio_features.append(audio)
             
-            # Extract features
-            features = self.extract_features(aligned_dataset)
-            
-            # Save features
-            self.save_features(features, self.aligned_dir)
-            
-            print("Preprocessing completed successfully!")
-            
-        except Exception as e:
-            print(f"Error during preprocessing: {str(e)}")
-            raise
+            # 获取标签
+            label = data['features']
+            labels.append(label)
+        
+        # 保存为numpy文件
+        np.save(os.path.join(ALIGNED_DIR, f'{split}_text.npy'), np.array(text_features))
+        np.save(os.path.join(ALIGNED_DIR, f'{split}_audio.npy'), np.array(audio_features))
+        np.save(os.path.join(ALIGNED_DIR, f'{split}_labels.npy'), np.array(labels))
+    
+    print("预处理完成！")
 
-def main():
-    # Set data directory
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'CMU_MOSEI')
-    
-    # Initialize preprocessor
-    preprocessor = MOSEIPreprocessor(data_dir)
-    
-    # Run preprocessing
-    preprocessor.preprocess()
-
-if __name__ == "__main__":
-    main() 
+if __name__ == '__main__':
+    download_and_align() 
