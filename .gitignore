@@ -40,9 +40,33 @@ data/
 *.npy
 *.npz
 
-# Logs
+# Model files
+*.pth
+*.pt
+*.ckpt
+*.bin
+weights/
+checkpoints/
+saved_models/
+
+# Logs and outputs
 *.log
 logs/
+runs/
+outputs/
+plots/
+*.png
+*.jpg
+*.jpeg
+*.pdf
+wandb/
+tensorboard/
+
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
 
 # OS
 .DS_Store
