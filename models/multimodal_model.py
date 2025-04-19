@@ -1,54 +1,101 @@
 import torch
 import torch.nn as nn
+from transformers import AutoModel, AutoTokenizer
 
-class BimodalSentimentModel(nn.Module):
-    def __init__(self, text_input_size, audio_input_size, hidden_size, num_classes, dropout=0.1):
-        super(BimodalSentimentModel, self).__init__()
+class AudioEncoder(nn.Module):
+    def __init__(self, input_dim=74, hidden_dim=128, num_layers=2):
+        super(AudioEncoder, self).__init__()
         
-        # Text feature processing
-        self.text_fc = nn.Linear(text_input_size, hidden_size)
-        self.text_bn = nn.BatchNorm1d(hidden_size)
+        # CNN layers for feature extraction
+        self.cnn = nn.Sequential(
+            nn.Conv1d(input_dim, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Conv1d(128, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Conv1d(256, 512, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(512)
+        )
         
-        # Audio feature processing
-        self.audio_fc = nn.Linear(audio_input_size, hidden_size)
-        self.audio_bn = nn.BatchNorm1d(hidden_size)
+        # LSTM layers for temporal modeling
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+        
+        # Output projection
+        self.projection = nn.Linear(hidden_dim * 2, hidden_dim)
+        
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, input_dim)
+        x = x.transpose(1, 2)  # (batch_size, input_dim, seq_len)
+        x = self.cnn(x)
+        x = x.transpose(1, 2)  # (batch_size, seq_len, 512)
+        
+        # LSTM processing
+        lstm_out, _ = self.lstm(x)
+        
+        # Use the last hidden state
+        last_hidden = lstm_out[:, -1, :]
+        
+        # Project to final dimension
+        output = self.projection(last_hidden)
+        return output
+
+class TextEncoder(nn.Module):
+    def __init__(self, model_name='bert-base-uncased', hidden_dim=128):
+        super(TextEncoder, self).__init__()
+        self.transformer = AutoModel.from_pretrained(model_name)
+        self.projection = nn.Linear(self.transformer.config.hidden_size, hidden_dim)
+        
+    def forward(self, input_ids, attention_mask):
+        # Get transformer outputs
+        outputs = self.transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        
+        # Use [CLS] token representation
+        cls_output = outputs.last_hidden_state[:, 0, :]
+        
+        # Project to final dimension
+        output = self.projection(cls_output)
+        return output
+
+class MultimodalModel(nn.Module):
+    def __init__(self, audio_input_dim=74, hidden_dim=128, num_classes=3):
+        super(MultimodalModel, self).__init__()
+        
+        # Initialize encoders
+        self.audio_encoder = AudioEncoder(
+            input_dim=audio_input_dim,
+            hidden_dim=hidden_dim
+        )
+        self.text_encoder = TextEncoder(hidden_dim=hidden_dim)
         
         # Fusion layer
-        self.fusion = nn.Linear(hidden_size * 2, hidden_size)
-        self.fusion_bn = nn.BatchNorm1d(hidden_size)
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, num_classes)
+        )
         
-        # Classifier
-        self.classifier = nn.Linear(hidden_size, num_classes)
+    def forward(self, audio_input, text_input_ids, text_attention_mask):
+        # Process audio
+        audio_features = self.audio_encoder(audio_input)
         
-        # Dropout
-        self.dropout = nn.Dropout(dropout)
-        
-        # Activation
-        self.relu = nn.ReLU()
-        
-    def forward(self, text, audio):
-        # Process text features
-        text_features = self.text_fc(text)
-        text_features = self.text_bn(text_features)
-        text_features = self.relu(text_features)
-        text_features = self.dropout(text_features)
-        
-        # Process audio features
-        audio_features = self.audio_fc(audio)
-        audio_features = self.audio_bn(audio_features)
-        audio_features = self.relu(audio_features)
-        audio_features = self.dropout(audio_features)
+        # Process text
+        text_features = self.text_encoder(text_input_ids, text_attention_mask)
         
         # Concatenate features
-        combined = torch.cat([text_features, audio_features], dim=1)
+        combined_features = torch.cat([audio_features, text_features], dim=1)
         
-        # Fusion
-        fused = self.fusion(combined)
-        fused = self.fusion_bn(fused)
-        fused = self.relu(fused)
-        fused = self.dropout(fused)
-        
-        # Classification
-        output = self.classifier(fused)
-        
+        # Final classification
+        output = self.fusion(combined_features)
         return output 
