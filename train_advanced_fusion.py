@@ -8,11 +8,12 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from models.decision_fusion_model import DecisionFusionModel
+from models.advanced_fusion_model import AdvancedFusionModel
 import torch.cuda.amp as amp
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
+from torch.optim.lr_scheduler import OneCycleLR
 
 class MOSEIDataset(Dataset):
     def __init__(self, text_path, audio_path, label_path, split='train', subset_ratio=0.01):
@@ -100,61 +101,23 @@ class MOSEIDataset(Dataset):
             'label': torch.LongTensor([label])
         }
 
-def plot_training_metrics(train_losses, val_losses, train_accs, val_accs, 
-                         audio_losses, text_losses, audio_accs, text_accs,
-                         fusion_weights, save_path='training_metrics.png'):
-    plt.figure(figsize=(20, 15))
+def plot_training_metrics(train_losses, val_losses, train_accs, val_accs, save_path='training_metrics.png'):
+    plt.figure(figsize=(12, 5))
     
-    # 绘制总损失曲线
-    plt.subplot(3, 2, 1)
-    plt.plot(train_losses, label='Train Loss (Total)')
-    plt.plot(val_losses, label='Val Loss (Total)')
-    plt.title('Total Training and Validation Loss')
+    # Plot losses
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.title('Training and Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     
-    # 绘制音频损失曲线
-    plt.subplot(3, 2, 2)
-    plt.plot(audio_losses['train'], label='Train Loss (Audio)')
-    plt.plot(audio_losses['val'], label='Val Loss (Audio)')
-    plt.title('Audio Training and Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    # 绘制文本损失曲线
-    plt.subplot(3, 2, 3)
-    plt.plot(text_losses['train'], label='Train Loss (Text)')
-    plt.plot(text_losses['val'], label='Val Loss (Text)')
-    plt.title('Text Training and Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
-    
-    # 绘制总准确率曲线
-    plt.subplot(3, 2, 4)
-    plt.plot(train_accs, label='Train Accuracy (Total)')
-    plt.plot(val_accs, label='Val Accuracy (Total)')
-    plt.title('Total Training and Validation Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    
-    # 绘制音频准确率曲线
-    plt.subplot(3, 2, 5)
-    plt.plot(audio_accs['train'], label='Train Accuracy (Audio)')
-    plt.plot(audio_accs['val'], label='Val Accuracy (Audio)')
-    plt.title('Audio Training and Validation Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
-    
-    # 绘制文本准确率曲线
-    plt.subplot(3, 2, 6)
-    plt.plot(text_accs['train'], label='Train Accuracy (Text)')
-    plt.plot(text_accs['val'], label='Val Accuracy (Text)')
-    plt.title('Text Training and Validation Accuracy')
+    # Plot accuracies
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accs, label='Train Accuracy')
+    plt.plot(val_accs, label='Val Accuracy')
+    plt.title('Training and Validation Accuracy')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy (%)')
     plt.legend()
@@ -164,30 +127,39 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.close()
 
 def train(model, train_loader, val_loader, device, num_epochs=20):
+    # Mixed precision training
     scaler = amp.GradScaler()
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
     
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    # Optimizer with weight decay
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=0.01,
+        betas=(0.9, 0.999)
     )
     
-    # Early stopping parameters
-    early_stopping_patience = 10
-    min_delta = 0.0005
+    # OneCycleLR scheduler
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=1e-3,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+        anneal_strategy='cos'
+    )
+    
+    # Early stopping
+    early_stopping_patience = 5
+    min_delta = 0.001
     best_val_loss = float('inf')
     patience_counter = 0
     
-    # Record training metrics
+    # Record metrics
     train_losses = []
     val_losses = []
     train_accs = []
     val_accs = []
-    audio_losses = {'train': [], 'val': []}
-    text_losses = {'train': [], 'val': []}
-    audio_accs = {'train': [], 'val': []}
-    text_accs = {'train': [], 'val': []}
-    fusion_weights = []
     
     for epoch in range(num_epochs):
         # Training phase
@@ -195,24 +167,18 @@ def train(model, train_loader, val_loader, device, num_epochs=20):
         train_loss = 0.0
         train_correct = 0
         train_total = 0
-        train_audio_loss = 0.0
-        train_text_loss = 0.0
-        train_audio_correct = 0
-        train_text_correct = 0
         
         progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        for batch_idx, batch in enumerate(progress_bar):
+        for batch in progress_bar:
             text_input_ids = batch['text_input_ids'].to(device, non_blocking=True)
             text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
             audio = batch['audio'].to(device, non_blocking=True)
             labels = batch['label'].squeeze().to(device, non_blocking=True)
             
+            # Mixed precision training
             with amp.autocast():
-                outputs, text_logits, audio_logits = model(audio, text_input_ids, text_attention_mask)
-                total_loss = criterion(outputs, labels)
-                audio_loss = criterion(audio_logits, labels)
-                text_loss = criterion(text_logits, labels)
-                loss = total_loss + 0.5 * (audio_loss + text_loss)
+                outputs = model(audio, text_input_ids, text_attention_mask)
+                loss = criterion(outputs, labels)
             
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -221,55 +187,29 @@ def train(model, train_loader, val_loader, device, num_epochs=20):
             scaler.step(optimizer)
             scaler.update()
             
-            scheduler.step(epoch + batch_idx / len(train_loader))
+            scheduler.step()
             
-            train_loss += total_loss.item()
-            train_audio_loss += audio_loss.item()
-            train_text_loss += text_loss.item()
-            
+            train_loss += loss.item()
             _, predicted = torch.max(outputs.data, 1)
-            _, audio_predicted = torch.max(audio_logits.data, 1)
-            _, text_predicted = torch.max(text_logits.data, 1)
-            
             train_total += labels.size(0)
             train_correct += (predicted == labels).sum().item()
-            train_audio_correct += (audio_predicted == labels).sum().item()
-            train_text_correct += (text_predicted == labels).sum().item()
             
             progress_bar.set_postfix({
                 'loss': loss.item(),
                 'acc': 100 * train_correct / train_total,
-                'audio_acc': 100 * train_audio_correct / train_total,
-                'text_acc': 100 * train_text_correct / train_total,
                 'lr': optimizer.param_groups[0]['lr']
             })
-            
-            if batch_idx % 10 == 0:
-                torch.cuda.empty_cache()
         
         train_loss /= len(train_loader)
-        train_audio_loss /= len(train_loader)
-        train_text_loss /= len(train_loader)
         train_acc = 100 * train_correct / train_total
-        train_audio_acc = 100 * train_audio_correct / train_total
-        train_text_acc = 100 * train_text_correct / train_total
-        
         train_losses.append(train_loss)
         train_accs.append(train_acc)
-        audio_losses['train'].append(train_audio_loss)
-        text_losses['train'].append(train_text_loss)
-        audio_accs['train'].append(train_audio_acc)
-        text_accs['train'].append(train_text_acc)
         
         # Validation phase
         model.eval()
         val_loss = 0.0
         val_correct = 0
         val_total = 0
-        val_audio_loss = 0.0
-        val_text_loss = 0.0
-        val_audio_correct = 0
-        val_text_correct = 0
         all_predictions = []
         all_labels = []
         
@@ -280,52 +220,25 @@ def train(model, train_loader, val_loader, device, num_epochs=20):
                 audio = batch['audio'].to(device, non_blocking=True)
                 labels = batch['label'].squeeze().to(device, non_blocking=True)
                 
-                outputs, text_logits, audio_logits = model(audio, text_input_ids, text_attention_mask)
-                total_loss = criterion(outputs, labels)
-                audio_loss = criterion(audio_logits, labels)
-                text_loss = criterion(text_logits, labels)
+                outputs = model(audio, text_input_ids, text_attention_mask)
+                loss = criterion(outputs, labels)
                 
-                val_loss += total_loss.item()
-                val_audio_loss += audio_loss.item()
-                val_text_loss += text_loss.item()
-                
+                val_loss += loss.item()
                 _, predicted = torch.max(outputs.data, 1)
-                _, audio_predicted = torch.max(audio_logits.data, 1)
-                _, text_predicted = torch.max(text_logits.data, 1)
-                
                 val_total += labels.size(0)
                 val_correct += (predicted == labels).sum().item()
-                val_audio_correct += (audio_predicted == labels).sum().item()
-                val_text_correct += (text_predicted == labels).sum().item()
                 
                 all_predictions.extend(predicted.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
         
         val_loss /= len(val_loader)
-        val_audio_loss /= len(val_loader)
-        val_text_loss /= len(val_loader)
         val_acc = 100 * val_correct / val_total
-        val_audio_acc = 100 * val_audio_correct / val_total
-        val_text_acc = 100 * val_text_correct / val_total
-        
         val_losses.append(val_loss)
         val_accs.append(val_acc)
-        audio_losses['val'].append(val_audio_loss)
-        text_losses['val'].append(val_text_loss)
-        audio_accs['val'].append(val_audio_acc)
-        text_accs['val'].append(val_text_acc)
-        
-        # Record fusion weights
-        weights = model.get_fusion_weights()
-        fusion_weights.append([weights['audio_weight'], weights['text_weight']])
         
         print(f'\nEpoch {epoch+1}/{num_epochs}:')
-        print(f'Total - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'Total - Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-        print(f'Audio - Train Loss: {train_audio_loss:.4f}, Train Acc: {train_audio_acc:.2f}%')
-        print(f'Audio - Val Loss: {val_audio_loss:.4f}, Val Acc: {val_audio_acc:.2f}%')
-        print(f'Text - Train Loss: {train_text_loss:.4f}, Train Acc: {train_text_acc:.2f}%')
-        print(f'Text - Val Loss: {val_text_loss:.4f}, Val Acc: {val_text_acc:.2f}%')
+        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         
         # Early stopping check
         if val_loss < best_val_loss - min_delta:
@@ -335,18 +248,14 @@ def train(model, train_loader, val_loader, device, num_epochs=20):
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss': val_loss,
                 'train_losses': train_losses,
                 'val_losses': val_losses,
                 'train_accs': train_accs,
-                'val_accs': val_accs,
-                'audio_losses': audio_losses,
-                'text_losses': text_losses,
-                'audio_accs': audio_accs,
-                'text_accs': text_accs,
-                'fusion_weights': np.array(fusion_weights)
-            }, 'best_decision_fusion_model.pth')
-            print(f"Decision fusion model saved with validation loss: {val_loss:.4f}")
+                'val_accs': val_accs
+            }, 'best_advanced_fusion_model.pth')
+            print(f"Model saved with validation loss: {val_loss:.4f}")
         else:
             patience_counter += 1
             print(f"Validation loss did not improve, patience: {patience_counter}/{early_stopping_patience}")
@@ -356,14 +265,7 @@ def train(model, train_loader, val_loader, device, num_epochs=20):
             break
     
     # Plot training metrics
-    plot_training_metrics(
-        train_losses, val_losses, 
-        train_accs, val_accs,
-        audio_losses, text_losses,
-        audio_accs, text_accs,
-        np.array(fusion_weights),
-        'training_metrics.png'
-    )
+    plot_training_metrics(train_losses, val_losses, train_accs, val_accs)
     
     # Output final evaluation report
     print("\nFinal evaluation report:")
@@ -387,12 +289,7 @@ def train(model, train_loader, val_loader, device, num_epochs=20):
         'train_losses': train_losses,
         'val_losses': val_losses,
         'train_accs': train_accs,
-        'val_accs': val_accs,
-        'audio_losses': audio_losses,
-        'text_losses': text_losses,
-        'audio_accs': audio_accs,
-        'text_accs': text_accs,
-        'fusion_weights': np.array(fusion_weights)
+        'val_accs': val_accs
     }
 
 def main():
@@ -405,7 +302,7 @@ def main():
     
     # Create datasets
     data_dir = 'data/CMU_MOSEI/aligned'
-    subset_ratio = 0.01  # Use 1% of data
+    subset_ratio = 0.5  # Use 50% of data
     train_dataset = MOSEIDataset(
         os.path.join(data_dir, 'train_text.npy'),
         os.path.join(data_dir, 'train_audio.npy'),
@@ -437,10 +334,11 @@ def main():
         pin_memory=True
     )
     
-    # Create model with correct input dimensions
-    model = DecisionFusionModel(
-        audio_input_dim=1,  # Single audio feature
-        hidden_dim=256,
+    # Create model
+    model = AdvancedFusionModel(
+        audio_input_dim=1,
+        text_hidden_dim=768,
+        hidden_dim=512,
         num_classes=5
     ).to(device)
     

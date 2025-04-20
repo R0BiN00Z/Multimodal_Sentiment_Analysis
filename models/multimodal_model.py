@@ -8,20 +8,20 @@ class AudioEncoder(nn.Module):
         
         # CNN layers for feature extraction
         self.cnn = nn.Sequential(
-            nn.Conv1d(input_dim, 128, kernel_size=3, padding=1),
+            nn.Conv1d(input_dim, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm1d(64),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.BatchNorm1d(128),
             nn.Conv1d(128, 256, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.BatchNorm1d(256),
-            nn.Conv1d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.BatchNorm1d(512)
+            nn.BatchNorm1d(256)
         )
         
         # LSTM layers for temporal modeling
         self.lstm = nn.LSTM(
-            input_size=512,
+            input_size=256,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
@@ -33,9 +33,12 @@ class AudioEncoder(nn.Module):
         
     def forward(self, x):
         # x shape: (batch_size, seq_len, input_dim)
-        x = x.transpose(1, 2)  # (batch_size, input_dim, seq_len)
+        # 添加一个通道维度
+        x = x.unsqueeze(1)  # (batch_size, 1, seq_len, input_dim)
+        x = x.squeeze(1)  # (batch_size, seq_len, input_dim)
+        x = x.permute(0, 2, 1)  # (batch_size, input_dim, seq_len)
         x = self.cnn(x)
-        x = x.transpose(1, 2)  # (batch_size, seq_len, 512)
+        x = x.permute(0, 2, 1)  # (batch_size, seq_len, 256)
         
         # LSTM processing
         lstm_out, _ = self.lstm(x)

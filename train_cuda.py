@@ -12,12 +12,13 @@ from models.multimodal_model import MultimodalModel
 import torch.cuda.amp as amp
 
 class MOSEIDataset(Dataset):
-    def __init__(self, text_path, audio_path, label_path, split='train', subset_ratio=0.01):
+    def __init__(self, text_path, audio_path, label_path, split='train', subset_ratio=0.50):
         # 使用 mmap_mode='r' 来减少内存使用
         self.text_data = np.load(text_path, mmap_mode='r')
         self.audio_data = np.load(audio_path, mmap_mode='r')
         self.labels = np.load(label_path, mmap_mode='r')
         self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+        self.split = split
         
         # 确保数据对齐
         assert len(self.text_data) == len(self.audio_data) == len(self.labels), \
@@ -34,6 +35,10 @@ class MOSEIDataset(Dataset):
         self.audio_data = self.audio_data[indices]
         self.labels = self.labels[indices]
         
+        # 类别平衡采样
+        if split == 'train':
+            self.balanced_indices = self._get_balanced_indices()
+        
         # 打印数据集信息
         print(f"\n{split} 集信息 (使用 {subset_ratio*100:.1f}% 的数据):")
         print(f"样本数量: {len(self.labels)}")
@@ -42,14 +47,42 @@ class MOSEIDataset(Dataset):
         for label, count in zip(unique, counts):
             print(f"类别 {label}: {count} 样本 ({count/len(self.labels)*100:.2f}%)")
     
+    def _get_balanced_indices(self):
+        # 获取每个类别的样本数
+        unique_labels, counts = np.unique(self.labels, return_counts=True)
+        max_count = max(counts)
+        
+        # 对每个类别进行过采样
+        balanced_indices = []
+        for label in unique_labels:
+            label_indices = np.where(self.labels == label)[0]
+            if len(label_indices) < max_count:
+                # 过采样
+                oversampled_indices = np.random.choice(label_indices, max_count, replace=True)
+                balanced_indices.extend(oversampled_indices)
+            else:
+                balanced_indices.extend(label_indices)
+        
+        return balanced_indices
+    
     def __len__(self):
+        if self.split == 'train':
+            return len(self.balanced_indices)
         return len(self.text_data)
     
     def __getitem__(self, idx):
+        if self.split == 'train':
+            idx = self.balanced_indices[idx]
+        
         # 获取文本和音频特征
-        text = self.text_data[idx].copy()  # 使用copy避免mmap问题
+        text = self.text_data[idx].copy()
         audio = self.audio_data[idx].copy()
         label = self.labels[idx].copy()
+        
+        # 数据增强：对音频特征添加随机噪声
+        if self.split == 'train':
+            noise = np.random.normal(0, 0.01, audio.shape)
+            audio = audio + noise
         
         # 将文本特征转换为字符串
         text_str = " ".join([str(x) for x in text])
@@ -73,7 +106,7 @@ class MOSEIDataset(Dataset):
             'label': torch.LongTensor([label])
         }
 
-def train(model, train_loader, val_loader, device, num_epochs=10):
+def train(model, train_loader, val_loader, device, num_epochs=20):
     # 使用混合精度训练
     scaler = amp.GradScaler()
     
@@ -81,16 +114,17 @@ def train(model, train_loader, val_loader, device, num_epochs=10):
     criterion = nn.CrossEntropyLoss()
     
     # 定义优化器
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
     
     # 学习率调度器
     scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=5, T_mult=2, eta_min=1e-6
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
     
-    # 初始化早停参数
+    # 设置早停参数
+    early_stopping_patience = 10  # 增加耐心值
+    min_delta = 0.0005  # 减小最小改善阈值
     best_val_loss = float('inf')
-    patience = 3
     patience_counter = 0
     
     # 初始化记录列表
@@ -121,7 +155,7 @@ def train(model, train_loader, val_loader, device, num_epochs=10):
                 loss = criterion(outputs, labels)
             
             # 反向传播和优化
-            optimizer.zero_grad(set_to_none=True)  # 更高效的梯度清零
+            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -187,10 +221,11 @@ def train(model, train_loader, val_loader, device, num_epochs=10):
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         
-        # 保存最佳模型
-        if val_loss < best_val_loss:
+        # 早停检查
+        if val_loss < best_val_loss - min_delta:
             best_val_loss = val_loss
             patience_counter = 0
+            # 保存最佳模型
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
@@ -201,12 +236,13 @@ def train(model, train_loader, val_loader, device, num_epochs=10):
                 'train_accs': train_accs,
                 'val_accs': val_accs
             }, 'best_model.pth')
+            print(f"模型已保存，验证损失: {val_loss:.4f}")
         else:
             patience_counter += 1
-        
-        # 早停检查
-        if patience_counter >= patience:
-            print(f'\nEarly stopping triggered after {epoch+1} epochs')
+            print(f"验证损失未改善，耐心值: {patience_counter}/{early_stopping_patience}")
+            
+        if patience_counter >= early_stopping_patience:
+            print(f"早停触发！{early_stopping_patience}个epoch内验证损失未改善")
             break
     
     return {
@@ -226,7 +262,7 @@ def main():
     
     # 创建数据集
     data_dir = 'data/CMU_MOSEI/aligned'
-    subset_ratio = 0.10  # 使用10%的数据
+    subset_ratio = 0.01  # 使用1%的数据
     train_dataset = MOSEIDataset(
         os.path.join(data_dir, 'train_text.npy'),
         os.path.join(data_dir, 'train_audio.npy'),
@@ -261,7 +297,7 @@ def main():
     # 创建模型
     model = MultimodalModel(
         audio_input_dim=1,
-        hidden_dim=128,
+        hidden_dim=256,  # 增加隐藏层维度
         num_classes=5
     ).to(device)
     

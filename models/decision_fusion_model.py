@@ -3,20 +3,21 @@ import torch.nn as nn
 from transformers import AutoModel, AutoTokenizer
 
 class AudioEncoder(nn.Module):
-    def __init__(self, input_dim=74, hidden_dim=128, num_layers=2):
+    def __init__(self, input_dim=1, hidden_dim=128, num_layers=2):
         super(AudioEncoder, self).__init__()
         
-        # 简化的音频编码器，适用于一维特征
+        # Simplified encoder for single-dimensional features
         self.encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.2),
-            nn.Linear(hidden_dim * 2, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim)
         )
         
     def forward(self, x):
-        # x shape: (batch_size, 1, 1)
-        x = x.squeeze(1)  # (batch_size, 1)
+        # x shape: (batch_size, input_dim) or (batch_size, 1, input_dim)
+        if x.dim() == 3:
+            x = x.squeeze(1)  # Remove channel dimension if present
         return self.encoder(x)
 
 class TextEncoder(nn.Module):
@@ -87,12 +88,7 @@ class DecisionFusionModel(nn.Module):
         # Weighted fusion of logits
         fused_logits = weights[0] * audio_logits + weights[1] * text_logits
         
-        return {
-            'fused_logits': fused_logits,
-            'audio_logits': audio_logits,
-            'text_logits': text_logits,
-            'weights': weights
-        }
+        return fused_logits, text_logits, audio_logits
     
     def get_fusion_weights(self):
         """Get the current fusion weights"""

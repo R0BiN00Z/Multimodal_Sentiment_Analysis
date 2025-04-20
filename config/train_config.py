@@ -25,4 +25,7 @@ class TrainConfig:
     
     # 早停设置
     early_stopping_patience: int = 3
-    early_stopping_threshold: float = 0.01 
+    early_stopping_threshold: float = 0.01
+    
+    # 数据集配置
+    subset_ratio: float = 0.30  # 使用30%的数据集 
