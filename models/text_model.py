@@ -1,48 +1,85 @@
 import torch
 import torch.nn as nn
-from transformers import BertModel
+import torch.nn.functional as F
 
-class TextModel(nn.Module):
-    def __init__(self, hidden_dim, num_classes):
-        super(TextModel, self).__init__()
+class TextTransformer(nn.Module):
+    def __init__(self, input_dim=300, hidden_dim=256, num_heads=8, num_layers=4, num_classes=5):
+        super(TextTransformer, self).__init__()
         
-        # 使用预训练的BERT模型
-        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        # Input projection
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
         
-        # 文本特征处理
-        self.text_encoder = nn.Sequential(
-            nn.Linear(768, hidden_dim),  # BERT输出维度是768
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(hidden_dim)
+        
+        # Transformer encoder layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=num_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True
         )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        # 分类器
+        # Classification head
         self.classifier = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_classes)
         )
+        
+        # Initialize weights
+        self._init_weights()
     
-    def forward(self, input_ids, attention_mask):
-        # 获取BERT输出
-        bert_outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True
-        )
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x):
+        # Input shape: [batch_size, seq_len, input_dim]
         
-        # 使用[CLS]标记的输出作为文本表示
-        text_features = bert_outputs.last_hidden_state[:, 0, :]  # [batch_size, 768]
+        # Project input to hidden dimension
+        x = self.input_proj(x)
         
-        # 文本特征处理
-        text_features = self.text_encoder(text_features)  # [batch_size, hidden_dim]
+        # Add positional encoding
+        x = self.pos_encoder(x)
         
-        # 分类
-        logits = self.classifier(text_features)
+        # Transformer encoder
+        x = self.transformer_encoder(x)
         
-        return logits 
+        # Global average pooling
+        x = torch.mean(x, dim=1)
+        
+        # Classifier
+        x = self.classifier(x)
+        
+        return x
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    
+    def forward(self, x):
+        # x: [batch_size, seq_len, d_model]
+        x = x + self.pe[:, :x.size(1)]
+        return x 

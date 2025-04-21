@@ -14,14 +14,28 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 from torch.optim.lr_scheduler import OneCycleLR
+import torch.nn.functional as F
+from sklearn.metrics import accuracy_score, f1_score
+
+# Training hyperparameters
+NUM_EPOCHS = 30
+BATCH_SIZE = 16  # Reduced batch size
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-4
+WARMUP_STEPS = 2000
+GRADIENT_CLIP = 1.0
+
+# Enable anomaly detection
+torch.autograd.set_detect_anomaly(True)
 
 class MOSEIDataset(Dataset):
     def __init__(self, text_path, audio_path, label_path, split='train', subset_ratio=0.01):
-        self.text_data = np.load(text_path, mmap_mode='r')
-        self.audio_data = np.load(audio_path, mmap_mode='r')
-        self.labels = np.load(label_path, mmap_mode='r')
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         self.split = split
+        
+        # Load data
+        self.text_data = np.load(text_path)
+        self.audio_data = np.load(audio_path)
+        self.labels = np.load(label_path)
         
         # Ensure data alignment
         assert len(self.text_data) == len(self.audio_data) == len(self.labels), \
@@ -38,29 +52,58 @@ class MOSEIDataset(Dataset):
         self.audio_data = self.audio_data[indices]
         self.labels = self.labels[indices]
         
-        # Class-balanced sampling
-        if split == 'train':
-            self.balanced_indices = self._get_balanced_indices()
+        # Clean and normalize text data
+        self.text_data = np.nan_to_num(self.text_data, nan=0.0, posinf=1.0, neginf=-1.0)
+        text_mean = np.mean(self.text_data, axis=(0, 1), keepdims=True)
+        text_std = np.std(self.text_data, axis=(0, 1), keepdims=True) + 1e-6
+        self.text_data = (self.text_data - text_mean) / text_std
         
+        # Clean and normalize audio data
+        self.audio_data = np.nan_to_num(self.audio_data, nan=0.0, posinf=1.0, neginf=-1.0)
+        audio_mean = np.mean(self.audio_data, axis=(0, 1), keepdims=True)
+        audio_std = np.std(self.audio_data, axis=(0, 1), keepdims=True) + 1e-6
+        self.audio_data = (self.audio_data - audio_mean) / audio_std
+        
+        # Clip values to reasonable range
+        self.text_data = np.clip(self.text_data, -10.0, 10.0)
+        self.audio_data = np.clip(self.audio_data, -10.0, 10.0)
+        
+        # Adjust audio feature dimension order
+        self.audio_data = np.transpose(self.audio_data, (0, 2, 1))
+        
+        # Print data information
         print(f"\n{split} set information (using {subset_ratio*100:.1f}% of data):")
         print(f"Number of samples: {len(self.labels)}")
+        print(f"Text data shape: {self.text_data.shape}")
+        print(f"Audio data shape: {self.audio_data.shape}")
+        print(f"Text data range: [{self.text_data.min():.3f}, {self.text_data.max():.3f}]")
+        print(f"Audio data range: [{self.audio_data.min():.3f}, {self.audio_data.max():.3f}]")
+        
         unique, counts = np.unique(self.labels, return_counts=True)
         print("Label distribution:")
-        for label, count in zip(unique, counts):
-            print(f"Class {label}: {count} samples ({count/len(self.labels)*100:.2f}%)")
+        for u, c in zip(unique, counts):
+            print(f"Class {u}: {c} samples ({c/len(self.labels)*100:.2f}%)")
+        
+        if split == 'train':
+            self.balanced_indices = self._get_balanced_indices()
     
     def _get_balanced_indices(self):
+        # 获取每个类别的样本数
         unique_labels, counts = np.unique(self.labels, return_counts=True)
         max_count = max(counts)
         
         balanced_indices = []
         for label in unique_labels:
+            # 获取当前类别的所有样本索引
             label_indices = np.where(self.labels == label)[0]
+            # 如果样本数不足，进行过采样
             if len(label_indices) < max_count:
                 oversampled_indices = np.random.choice(label_indices, max_count, replace=True)
                 balanced_indices.extend(oversampled_indices)
             else:
-                balanced_indices.extend(label_indices)
+                # 如果样本数过多，进行欠采样
+                undersampled_indices = np.random.choice(label_indices, max_count, replace=False)
+                balanced_indices.extend(undersampled_indices)
         
         return balanced_indices
     
@@ -73,32 +116,20 @@ class MOSEIDataset(Dataset):
         if self.split == 'train':
             idx = self.balanced_indices[idx]
         
-        text = self.text_data[idx].copy()
-        audio = self.audio_data[idx].copy()
-        label = self.labels[idx].copy()
+        text = self.text_data[idx]
+        audio = self.audio_data[idx]
+        label = self.labels[idx]
         
-        # Convert audio to float32 tensor with shape (1,)
-        audio = torch.tensor([float(audio)], dtype=torch.float32)
-        
-        # Data augmentation: add random noise to audio features during training
-        if self.split == 'train':
-            noise = torch.randn_like(audio) * 0.01
-            audio = audio + noise
-        
-        text_str = " ".join([str(x) for x in text])
-        text_encoding = self.tokenizer(
-            text_str,
-            max_length=512,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
+        # Convert to PyTorch tensors
+        text = torch.FloatTensor(text)
+        audio = torch.FloatTensor(audio)
+        label = torch.tensor(label, dtype=torch.long)
         
         return {
-            'text_input_ids': text_encoding['input_ids'].squeeze(0),
-            'text_attention_mask': text_encoding['attention_mask'].squeeze(0),
+            'text_input_ids': text,
+            'text_attention_mask': torch.ones_like(text[:, 0]),
             'audio': audio,
-            'label': torch.LongTensor([label])
+            'label': label
         }
 
 def plot_training_metrics(train_losses, val_losses, train_accs, val_accs, save_path='training_metrics.png'):
@@ -126,225 +157,251 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs, save_p
     plt.savefig(save_path)
     plt.close()
 
-def train(model, train_loader, val_loader, device, num_epochs=20):
-    # Mixed precision training
-    scaler = amp.GradScaler()
-    criterion = nn.CrossEntropyLoss()
+def calculate_class_weights(labels):
+    # 计算类别权重
+    class_counts = np.bincount(labels)
+    total = len(labels)
+    class_weights = torch.FloatTensor(total / (len(class_counts) * class_counts))
+    return class_weights
+
+def train_epoch(model, train_loader, criterion, optimizer, device, epoch, scaler):
+    model.train()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    total_batches = 0
     
-    # Optimizer with weight decay
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=1e-4,
-        weight_decay=0.01,
-        betas=(0.9, 0.999)
-    )
-    
-    # OneCycleLR scheduler
-    scheduler = OneCycleLR(
-        optimizer,
-        max_lr=1e-3,
-        epochs=num_epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,
-        anneal_strategy='cos'
-    )
-    
-    # Early stopping
-    early_stopping_patience = 5
-    min_delta = 0.001
-    best_val_loss = float('inf')
-    patience_counter = 0
-    
-    # Record metrics
-    train_losses = []
-    val_losses = []
-    train_accs = []
-    val_accs = []
-    
-    for epoch in range(num_epochs):
-        # Training phase
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
+    for batch_idx, batch in enumerate(train_loader):
+        # Move data to device
+        text_data = batch['text_input_ids'].to(device)
+        audio_data = batch['audio'].to(device)
+        labels = batch['label'].to(device)
         
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        for batch in progress_bar:
-            text_input_ids = batch['text_input_ids'].to(device, non_blocking=True)
-            text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
-            audio = batch['audio'].to(device, non_blocking=True)
-            labels = batch['label'].squeeze().to(device, non_blocking=True)
+        # Skip empty batches
+        if labels.numel() == 0:
+            continue
             
-            # Mixed precision training
-            with amp.autocast():
-                outputs = model(audio, text_input_ids, text_attention_mask)
-                loss = criterion(outputs, labels)
-            
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            scheduler.step()
-            
-            train_loss += loss.item()
-            _, predicted = torch.max(outputs.data, 1)
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-            
-            progress_bar.set_postfix({
-                'loss': loss.item(),
-                'acc': 100 * train_correct / train_total,
-                'lr': optimizer.param_groups[0]['lr']
-            })
+        # Forward pass with AMP
+        with torch.amp.autocast('cuda'):
+            logits = model(audio_data, text_data)
+            loss = criterion(logits, labels)
         
-        train_loss /= len(train_loader)
-        train_acc = 100 * train_correct / train_total
-        train_losses.append(train_loss)
-        train_accs.append(train_acc)
+        # Check for NaN in logits
+        if torch.isnan(logits).any():
+            print(f"NaN detected in logits at batch {batch_idx}")
+            continue
         
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        all_predictions = []
-        all_labels = []
+        # Backward pass with AMP
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
         
-        with torch.no_grad(), amp.autocast():
-            for batch in val_loader:
-                text_input_ids = batch['text_input_ids'].to(device, non_blocking=True)
-                text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
-                audio = batch['audio'].to(device, non_blocking=True)
-                labels = batch['label'].squeeze().to(device, non_blocking=True)
+        # Gradient clipping
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRADIENT_CLIP)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
+        # Track metrics
+        total_loss += loss.item()
+        preds = torch.argmax(logits, dim=1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        total_batches += 1
+        
+        if batch_idx % 10 == 0:
+            print(f'Epoch {epoch} [{batch_idx}/{len(train_loader)}] '
+                  f'Loss: {loss.item():.4f}')
+    
+    # Calculate epoch metrics
+    if total_batches > 0:
+        avg_loss = total_loss / total_batches
+        accuracy = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average='weighted')
+    else:
+        avg_loss = float('inf')
+        accuracy = 0.0
+        f1 = 0.0
+    
+    return avg_loss, accuracy, f1
+
+def validate(model, val_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    total_batches = 0
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            text_data = batch['text_input_ids'].to(device)
+            audio_data = batch['audio'].to(device)
+            labels = batch['label'].to(device)
+            
+            if labels.numel() == 0:
+                continue
                 
-                outputs = model(audio, text_input_ids, text_attention_mask)
-                loss = criterion(outputs, labels)
-                
-                val_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-                
-                all_predictions.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        val_loss /= len(val_loader)
-        val_acc = 100 * val_correct / val_total
-        val_losses.append(val_loss)
-        val_accs.append(val_acc)
-        
-        print(f'\nEpoch {epoch+1}/{num_epochs}:')
-        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-        
-        # Early stopping check
-        if val_loss < best_val_loss - min_delta:
-            best_val_loss = val_loss
-            patience_counter = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'train_accs': train_accs,
-                'val_accs': val_accs
-            }, 'best_advanced_fusion_model.pth')
-            print(f"Model saved with validation loss: {val_loss:.4f}")
-        else:
-            patience_counter += 1
-            print(f"Validation loss did not improve, patience: {patience_counter}/{early_stopping_patience}")
+            with torch.amp.autocast('cuda'):
+                logits = model(audio_data, text_data)
+                loss = criterion(logits, labels)
             
-        if patience_counter >= early_stopping_patience:
-            print(f"Early stopping triggered! No improvement in validation loss for {early_stopping_patience} epochs")
-            break
+            total_loss += loss.item()
+            preds = torch.argmax(logits, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            total_batches += 1
     
-    # Plot training metrics
-    plot_training_metrics(train_losses, val_losses, train_accs, val_accs)
+    if total_batches > 0:
+        avg_loss = total_loss / total_batches
+        accuracy = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average='weighted')
+    else:
+        avg_loss = float('inf')
+        accuracy = 0.0
+        f1 = 0.0
     
-    # Output final evaluation report
-    print("\nFinal evaluation report:")
-    print(classification_report(
-        all_labels, 
-        all_predictions,
-        target_names=['Very Negative', 'Negative', 'Neutral', 'Positive', 'Very Positive']
-    ))
-    
-    # Plot confusion matrix
-    plt.figure(figsize=(10, 8))
-    cm = confusion_matrix(all_labels, all_predictions)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.savefig('confusion_matrix.png')
-    plt.close()
-    
-    return {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_accs': train_accs,
-        'val_accs': val_accs
-    }
+    return avg_loss, accuracy, f1
 
 def main():
-    if not torch.cuda.is_available():
-        print("CUDA is not available. Please check your GPU setup.")
-        return
+    # Set random seeds
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
     
-    device = torch.device("cuda")
-    print(f'Using GPU: {torch.cuda.get_device_name(0)}')
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
     
-    # Create datasets
-    data_dir = 'data/CMU_MOSEI/aligned'
-    subset_ratio = 0.5  # Use 50% of data
+    # Initialize AMP scaler
+    scaler = torch.amp.GradScaler('cuda')
+    
+    # Load datasets
     train_dataset = MOSEIDataset(
-        os.path.join(data_dir, 'train_text.npy'),
-        os.path.join(data_dir, 'train_audio.npy'),
-        os.path.join(data_dir, 'train_labels.npy'),
-        'train',
-        subset_ratio=subset_ratio
+        text_path='data/CMU_MOSEI/aligned/train_text.npy',
+        audio_path='data/CMU_MOSEI/aligned/train_audio.npy',
+        label_path='data/CMU_MOSEI/aligned/train_labels.npy',
+        split='train',
+        subset_ratio=0.5
     )
+    
     val_dataset = MOSEIDataset(
-        os.path.join(data_dir, 'valid_text.npy'),
-        os.path.join(data_dir, 'valid_audio.npy'),
-        os.path.join(data_dir, 'valid_labels.npy'),
-        'valid',
-        subset_ratio=subset_ratio
+        text_path='data/CMU_MOSEI/aligned/valid_text.npy',
+        audio_path='data/CMU_MOSEI/aligned/valid_audio.npy',
+        label_path='data/CMU_MOSEI/aligned/valid_labels.npy',
+        split='valid',
+        subset_ratio=0.5
     )
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=32,
-        shuffle=False,
-        num_workers=4,
+        num_workers=0,
         pin_memory=True
     )
     
-    # Create model
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        pin_memory=True
+    )
+    
+    # Initialize model
     model = AdvancedFusionModel(
-        audio_input_dim=1,
-        text_hidden_dim=768,
-        hidden_dim=512,
+        audio_input_dim=74,
+        text_input_dim=300,
+        hidden_dim=256,
         num_classes=5
     ).to(device)
     
-    # Train model
-    print('Starting training...')
-    train(model, train_loader, val_loader, device)
+    # Setup training
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY
+    )
+    
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,
+        epochs=NUM_EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.5,
+        anneal_strategy='cos',
+        div_factor=1.5,
+        final_div_factor=10.0
+    )
+    
+    # Training loop
+    best_val_f1 = 0
+    train_losses = []
+    val_losses = []
+    train_accs = []
+    val_accs = []
+    
+    for epoch in range(NUM_EPOCHS):
+        print(f'\nEpoch {epoch+1}/{NUM_EPOCHS}')
+        
+        # Train
+        train_loss, train_acc, train_f1 = train_epoch(
+            model, train_loader, criterion, optimizer, device, epoch, scaler
+        )
+        print(f'Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}, F1: {train_f1:.4f}')
+        train_losses.append(train_loss)
+        train_accs.append(train_acc)
+        
+        # Validate
+        val_loss, val_acc, val_f1 = validate(model, val_loader, criterion, device)
+        print(f'Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, F1: {val_f1:.4f}')
+        val_losses.append(val_loss)
+        val_accs.append(val_acc)
+        
+        # Save best model
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_f1': best_val_f1,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
+                'train_accs': train_accs,
+                'val_accs': val_accs
+            }, 'best_model.pt')
+            print(f'New best model saved with validation F1: {best_val_f1:.4f}')
+        
+        scheduler.step()
+    
+    print('Training completed!')
+    
+    # Plot training curves
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Val Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accs, label='Train Accuracy')
+    plt.plot(val_accs, label='Val Accuracy')
+    plt.title('Training and Validation Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig('training_curves.png')
+    plt.close()
 
 if __name__ == '__main__':
     main() 

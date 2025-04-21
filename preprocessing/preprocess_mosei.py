@@ -78,6 +78,18 @@ def safe_mean(x):
         print(f"Error in safe_mean: {str(e)}")
         return None
 
+def pad_or_truncate(data, target_len, pad_value=0.0):
+    """
+    对任意长度的二维序列数据进行 padding 或截断，使其变为 (target_len, feature_dim)
+    """
+    seq_len, feature_dim = data.shape
+    if seq_len >= target_len:
+        return data[:target_len]
+    else:
+        pad_shape = (target_len - seq_len, feature_dim)
+        padding = np.full(pad_shape, pad_value, dtype=data.dtype)
+        return np.vstack([data, padding])
+
 def process_features(dataset, vids, feature_name):
     """Process features for a list of video IDs using vectorized operations.
     
@@ -90,22 +102,21 @@ def process_features(dataset, vids, feature_name):
         List of processed features
     """
     features = []
+    T_text = 50  # 文本序列长度
+    T_audio = 50  # 音频序列长度
+    
     for vid in tqdm(vids, desc=f"Processing {feature_name}"):
         try:
             data = dataset.computational_sequences[feature_name].data[vid]['features']
-            if feature_name == 'COVAREP':
-                # 将数据转换为PyTorch张量并移动到指定设备
-                data_tensor = torch.tensor(data, device=DEVICE)
-                # For audio features, compute mean
-                mean_val = safe_mean(data_tensor.cpu().numpy())  # 将结果移回CPU进行后续处理
-                if mean_val is not None:
-                    features.append(mean_val)
-            else:
-                # For text features, keep original
-                if data is not None and data.size > 0:
-                    # 将文本特征转换为PyTorch张量并移动到指定设备
-                    data_tensor = torch.tensor(data, device=DEVICE)
-                    features.append(data_tensor.cpu().numpy())  # 将结果移回CPU进行后续处理
+            if data.shape[0] > 0:
+                if feature_name == 'COVAREP':
+                    # 处理音频特征，转置为 [74, T_audio]
+                    padded_audio = pad_or_truncate(data, T_audio).T
+                    features.append(padded_audio)
+                else:
+                    # 处理文本特征，保持 [T_text, 300]
+                    padded_text = pad_or_truncate(data, T_text)
+                    features.append(padded_text)
         except Exception as e:
             print(f"Error processing {feature_name} for video {vid}: {str(e)}")
             continue

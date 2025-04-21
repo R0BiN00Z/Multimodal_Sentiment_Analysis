@@ -13,13 +13,13 @@ import torch.cuda.amp as amp
 import matplotlib.pyplot as plt
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
+import torch.nn.functional as F
 
 class MOSEIDataset(Dataset):
     def __init__(self, text_path, audio_path, label_path, split='train', subset_ratio=0.01):
         self.text_data = np.load(text_path, mmap_mode='r')
         self.audio_data = np.load(audio_path, mmap_mode='r')
         self.labels = np.load(label_path, mmap_mode='r')
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
         self.split = split
         
         # Ensure data alignment
@@ -43,6 +43,8 @@ class MOSEIDataset(Dataset):
         
         print(f"\n{split} set information (using {subset_ratio*100:.1f}% of data):")
         print(f"Number of samples: {len(self.labels)}")
+        print(f"Text data shape: {self.text_data.shape}")
+        print(f"Audio data shape: {self.audio_data.shape}")
         unique, counts = np.unique(self.labels, return_counts=True)
         print("Label distribution:")
         for label, count in zip(unique, counts):
@@ -76,28 +78,15 @@ class MOSEIDataset(Dataset):
         audio = self.audio_data[idx].copy()
         label = self.labels[idx].copy()
         
-        # Convert audio to float32 tensor with shape (1,)
-        audio = torch.tensor([float(audio)], dtype=torch.float32)
-        
-        # Data augmentation: add random noise to audio features during training
-        if self.split == 'train':
-            noise = torch.randn_like(audio) * 0.01
-            audio = audio + noise
-        
-        text_str = " ".join([str(x) for x in text])
-        text_encoding = self.tokenizer(
-            text_str,
-            max_length=512,
-            padding='max_length',
-            truncation=True,
-            return_tensors='pt'
-        )
+        # Convert to PyTorch tensors
+        text = torch.FloatTensor(text)
+        audio = torch.FloatTensor(audio)
+        label = torch.tensor(label, dtype=torch.long)
         
         return {
-            'text_input_ids': text_encoding['input_ids'].squeeze(0),
-            'text_attention_mask': text_encoding['attention_mask'].squeeze(0),
+            'text': text,
             'audio': audio,
-            'label': torch.LongTensor([label])
+            'label': label
         }
 
 def plot_training_metrics(train_losses, val_losses, train_accs, val_accs, 
@@ -105,7 +94,7 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
                          fusion_weights, save_path='training_metrics.png'):
     plt.figure(figsize=(20, 15))
     
-    # 绘制总损失曲线
+    # Plot total loss
     plt.subplot(3, 2, 1)
     plt.plot(train_losses, label='Train Loss (Total)')
     plt.plot(val_losses, label='Val Loss (Total)')
@@ -114,7 +103,7 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.ylabel('Loss')
     plt.legend()
     
-    # 绘制音频损失曲线
+    # Plot audio loss
     plt.subplot(3, 2, 2)
     plt.plot(audio_losses['train'], label='Train Loss (Audio)')
     plt.plot(audio_losses['val'], label='Val Loss (Audio)')
@@ -123,7 +112,7 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.ylabel('Loss')
     plt.legend()
     
-    # 绘制文本损失曲线
+    # Plot text loss
     plt.subplot(3, 2, 3)
     plt.plot(text_losses['train'], label='Train Loss (Text)')
     plt.plot(text_losses['val'], label='Val Loss (Text)')
@@ -132,7 +121,7 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.ylabel('Loss')
     plt.legend()
     
-    # 绘制总准确率曲线
+    # Plot total accuracy
     plt.subplot(3, 2, 4)
     plt.plot(train_accs, label='Train Accuracy (Total)')
     plt.plot(val_accs, label='Val Accuracy (Total)')
@@ -141,7 +130,7 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.ylabel('Accuracy (%)')
     plt.legend()
     
-    # 绘制音频准确率曲线
+    # Plot audio accuracy
     plt.subplot(3, 2, 5)
     plt.plot(audio_accs['train'], label='Train Accuracy (Audio)')
     plt.plot(audio_accs['val'], label='Val Accuracy (Audio)')
@@ -150,7 +139,7 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.ylabel('Accuracy (%)')
     plt.legend()
     
-    # 绘制文本准确率曲线
+    # Plot text accuracy
     plt.subplot(3, 2, 6)
     plt.plot(text_accs['train'], label='Train Accuracy (Text)')
     plt.plot(text_accs['val'], label='Val Accuracy (Text)')
@@ -163,237 +152,311 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs,
     plt.savefig(save_path)
     plt.close()
 
-def train(model, train_loader, val_loader, device, num_epochs=20):
-    scaler = amp.GradScaler()
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=0.01)
+# Hyperparameters
+LEARNING_RATE = 1e-5  # Reduced learning rate
+WEIGHT_DECAY = 1e-4
+BATCH_SIZE = 32
+NUM_EPOCHS = 30
+PATIENCE = 5  # For early stopping
+GRAD_CLIP = 5.0  # Increased gradient clipping threshold
+
+class LabelSmoothingLoss(nn.Module):
+    def __init__(self, classes=5, smoothing=0.1, ignore_index=-100):
+        super(LabelSmoothingLoss, self).__init__()
+        self.confidence = 1.0 - smoothing
+        self.smoothing = smoothing
+        self.classes = classes
+        self.ignore_index = ignore_index
+
+    def forward(self, pred, target):
+        if pred.dim() > 2:
+            pred = pred.view(-1, pred.size(-1))
+        target = target.view(-1)
+        
+        # Create mask for valid (not ignored) positions
+        valid_mask = (target != self.ignore_index)
+        valid_positions = valid_mask.sum()
+        
+        if valid_positions == 0:
+            return torch.tensor(0.0, device=pred.device, requires_grad=True)
+        
+        # Apply log_softmax with better numerical stability
+        log_prob = F.log_softmax(pred, dim=-1)
+        
+        # Create smoothed targets
+        with torch.no_grad():
+            true_dist = torch.zeros_like(pred)
+            true_dist.fill_(self.smoothing / (self.classes - 1))
+            true_dist.scatter_(1, target.unsqueeze(1), self.confidence)
+        
+        # Calculate loss only for valid positions
+        losses = -(true_dist * log_prob)
+        return losses[valid_mask].mean()
+
+def train_epoch(model, train_loader, optimizer, criterion, device, scheduler=None):
+    model.train()
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
     
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6
+    audio_correct = 0
+    text_correct = 0
+    
+    for batch_idx, batch in enumerate(train_loader):
+        # Move data to device
+        audio = batch['audio'].to(device)
+        text = batch['text'].to(device)
+        labels = batch['label'].to(device)
+        
+        # Log input shapes and ranges periodically
+        if batch_idx % 100 == 0:
+            print(f'\nBatch {batch_idx} input stats:')
+            print(f'Audio shape: {audio.shape}, range: [{audio.min():.3f}, {audio.max():.3f}]')
+            print(f'Text shape: {text.shape}, range: [{text.min():.3f}, {text.max():.3f}]')
+            print(f'Labels shape: {labels.shape}, unique values: {torch.unique(labels).tolist()}')
+        
+        optimizer.zero_grad()
+        
+        # Forward pass with gradient scaling
+        with torch.amp.autocast('cuda'):
+            outputs, text_logits, audio_logits = model(audio, text)
+            
+            # Calculate losses with stability checks
+            try:
+                loss = criterion(outputs, labels)
+                audio_loss = criterion(audio_logits, labels)
+                text_loss = criterion(text_logits, labels)
+                
+                # Combined loss with stability check
+                if not (torch.isnan(loss) or torch.isnan(audio_loss) or torch.isnan(text_loss)):
+                    total_loss = loss + 0.5 * (audio_loss + text_loss)
+                else:
+                    print(f"Warning: NaN loss detected at batch {batch_idx}")
+                    continue
+                
+            except RuntimeError as e:
+                print(f"Error in loss calculation at batch {batch_idx}: {e}")
+                continue
+            
+            # Log intermediate outputs
+            if batch_idx % 100 == 0:
+                print('\nModel outputs:')
+                print(f'Fused logits shape: {outputs.shape}, range: [{outputs.min():.3f}, {outputs.max():.3f}]')
+                print(f'Text logits shape: {text_logits.shape}, range: [{text_logits.min():.3f}, {text_logits.max():.3f}]')
+                print(f'Audio logits shape: {audio_logits.shape}, range: [{audio_logits.min():.3f}, {audio_logits.max():.3f}]')
+                print(f'Loss components - Main: {loss:.4f}, Audio: {audio_loss:.4f}, Text: {text_loss:.4f}')
+                
+                weights = model.get_fusion_weights()
+                print(f'Fusion weights - Audio: {weights["audio_weight"]:.3f}, Text: {weights["text_weight"]:.3f}')
+        
+        # Backward pass with gradient clipping
+        total_loss.backward()
+        
+        # Log gradients
+        if batch_idx % 100 == 0:
+            print('\nGradient stats before clipping:')
+            total_grad_norm = 0
+            max_grad_norm = 0
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    total_grad_norm += grad_norm
+                    max_grad_norm = max(max_grad_norm, grad_norm)
+                    if grad_norm > 10:
+                        print(f'Large gradient in {name}: {grad_norm:.3f}')
+            print(f'Total gradient norm: {total_grad_norm:.3f}')
+            print(f'Max gradient norm: {max_grad_norm:.3f}')
+        
+        # Clip gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        
+        # Log gradients after clipping
+        if batch_idx % 100 == 0:
+            print('\nGradient stats after clipping:')
+            total_grad_norm = 0
+            max_grad_norm = 0
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    total_grad_norm += grad_norm
+                    max_grad_norm = max(max_grad_norm, grad_norm)
+            print(f'Total gradient norm: {total_grad_norm:.3f}')
+            print(f'Max gradient norm: {max_grad_norm:.3f}')
+        
+        # Update weights
+        optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
+        
+        # Calculate metrics
+        with torch.no_grad():
+            _, predicted = outputs.max(1)
+            batch_correct = predicted.eq(labels).sum().item()
+            total_correct += batch_correct
+            total_samples += labels.size(0)
+            
+            _, audio_pred = audio_logits.max(1)
+            _, text_pred = text_logits.max(1)
+            audio_correct += audio_pred.eq(labels).sum().item()
+            text_correct += text_pred.eq(labels).sum().item()
+        
+        # Log batch metrics
+        if batch_idx % 100 == 0:
+            print(f'\nBatch {batch_idx}/{len(train_loader)} metrics:')
+            print(f'Loss: {total_loss.item():.4f}')
+            print(f'Batch accuracy: {100.*batch_correct/labels.size(0):.2f}%')
+            print(f'Running accuracy: {100.*total_correct/total_samples:.2f}%')
+            print(f'Audio accuracy: {100.*audio_correct/total_samples:.2f}%')
+            print(f'Text accuracy: {100.*text_correct/total_samples:.2f}%')
+            
+            # Log prediction distribution
+            pred_dist = torch.bincount(predicted, minlength=5)
+            print(f'Prediction distribution: {pred_dist.tolist()}')
+    
+    return total_loss.item() / len(train_loader), 100.*total_correct/total_samples, \
+           100.*audio_correct/total_samples, 100.*text_correct/total_samples
+
+def validate(model, val_loader, criterion, device):
+    model.eval()
+    total_loss = 0
+    total_correct = 0
+    total_samples = 0
+    
+    audio_correct = 0
+    text_correct = 0
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            # Move data to device
+            audio = batch['audio'].to(device)
+            text = batch['text'].to(device)
+            labels = batch['label'].to(device)
+            
+            # Log input shapes and ranges periodically
+            if batch_idx % 50 == 0:
+                print(f'\nValidation batch {batch_idx} input stats:')
+                print(f'Audio shape: {audio.shape}, range: [{audio.min():.3f}, {audio.max():.3f}]')
+                print(f'Text shape: {text.shape}, range: [{text.min():.3f}, {text.max():.3f}]')
+                print(f'Labels shape: {labels.shape}, unique values: {torch.unique(labels).tolist()}')
+            
+            with torch.amp.autocast('cuda'):
+                outputs, text_logits, audio_logits = model(audio, text)
+                loss = criterion(outputs, labels)
+                
+                # Log outputs periodically
+                if batch_idx % 50 == 0:
+                    print('\nValidation outputs:')
+                    print(f'Fused logits range: [{outputs.min():.3f}, {outputs.max():.3f}]')
+                    print(f'Text logits range: [{text_logits.min():.3f}, {text_logits.max():.3f}]')
+                    print(f'Audio logits range: [{audio_logits.min():.3f}, {audio_logits.max():.3f}]')
+                    weights = model.get_fusion_weights()
+                    print(f'Fusion weights - Audio: {weights["audio_weight"]:.3f}, Text: {weights["text_weight"]:.3f}')
+            
+            total_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total_correct += predicted.eq(labels).sum().item()
+            total_samples += labels.size(0)
+            
+            # Calculate individual modality accuracies
+            _, audio_pred = audio_logits.max(1)
+            _, text_pred = text_logits.max(1)
+            audio_correct += audio_pred.eq(labels).sum().item()
+            text_correct += text_pred.eq(labels).sum().item()
+            
+            # Log metrics periodically
+            if batch_idx % 50 == 0:
+                print(f'\nValidation batch {batch_idx} metrics:')
+                print(f'Loss: {loss.item():.4f}')
+                print(f'Batch accuracy: {100.*predicted.eq(labels).sum().item()/labels.size(0):.2f}%')
+                print(f'Running accuracy: {100.*total_correct/total_samples:.2f}%')
+                print(f'Audio accuracy: {100.*audio_correct/total_samples:.2f}%')
+                print(f'Text accuracy: {100.*text_correct/total_samples:.2f}%')
+                
+                # Log prediction distribution
+                pred_dist = torch.bincount(predicted, minlength=5)
+                print(f'Prediction distribution: {pred_dist.tolist()}')
+    
+    return total_loss / len(val_loader), 100.*total_correct/total_samples, \
+           100.*audio_correct/total_samples, 100.*text_correct/total_samples
+
+def train(model, train_loader, val_loader, device, num_epochs=NUM_EPOCHS):
+    # Initialize criterion with label smoothing
+    criterion = LabelSmoothingLoss(classes=5, smoothing=0.1)
+    
+    # Initialize optimizer with gradient clipping
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+        betas=(0.9, 0.999),
+        eps=1e-8
     )
     
-    # Early stopping parameters
-    early_stopping_patience = 10
-    min_delta = 0.0005
-    best_val_loss = float('inf')
-    patience_counter = 0
+    # Learning rate scheduler with warm-up
+    num_training_steps = len(train_loader) * num_epochs
+    num_warmup_steps = num_training_steps // 10
     
-    # Record training metrics
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=LEARNING_RATE,
+        epochs=num_epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.1,  # Warm-up for 10% of training
+        anneal_strategy='cos',
+        cycle_momentum=True,
+        base_momentum=0.85,
+        max_momentum=0.95,
+        div_factor=10.0,
+        final_div_factor=1e4,
+    )
+    
     train_losses = []
     val_losses = []
-    train_accs = []
-    val_accs = []
-    audio_losses = {'train': [], 'val': []}
-    text_losses = {'train': [], 'val': []}
-    audio_accs = {'train': [], 'val': []}
-    text_accs = {'train': [], 'val': []}
-    fusion_weights = []
+    best_val_acc = 0
+    patience_counter = 0
     
     for epoch in range(num_epochs):
+        print(f'\nEpoch {epoch+1}/{num_epochs}')
+        print(f'Learning rate: {scheduler.get_last_lr()[0]:.2e}')
+        
         # Training phase
-        model.train()
-        train_loss = 0.0
-        train_correct = 0
-        train_total = 0
-        train_audio_loss = 0.0
-        train_text_loss = 0.0
-        train_audio_correct = 0
-        train_text_correct = 0
-        
-        progress_bar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        for batch_idx, batch in enumerate(progress_bar):
-            text_input_ids = batch['text_input_ids'].to(device, non_blocking=True)
-            text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
-            audio = batch['audio'].to(device, non_blocking=True)
-            labels = batch['label'].squeeze().to(device, non_blocking=True)
-            
-            with amp.autocast():
-                outputs, text_logits, audio_logits = model(audio, text_input_ids, text_attention_mask)
-                total_loss = criterion(outputs, labels)
-                audio_loss = criterion(audio_logits, labels)
-                text_loss = criterion(text_logits, labels)
-                loss = total_loss + 0.5 * (audio_loss + text_loss)
-            
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            
-            scheduler.step(epoch + batch_idx / len(train_loader))
-            
-            train_loss += total_loss.item()
-            train_audio_loss += audio_loss.item()
-            train_text_loss += text_loss.item()
-            
-            _, predicted = torch.max(outputs.data, 1)
-            _, audio_predicted = torch.max(audio_logits.data, 1)
-            _, text_predicted = torch.max(text_logits.data, 1)
-            
-            train_total += labels.size(0)
-            train_correct += (predicted == labels).sum().item()
-            train_audio_correct += (audio_predicted == labels).sum().item()
-            train_text_correct += (text_predicted == labels).sum().item()
-            
-            progress_bar.set_postfix({
-                'loss': loss.item(),
-                'acc': 100 * train_correct / train_total,
-                'audio_acc': 100 * train_audio_correct / train_total,
-                'text_acc': 100 * train_text_correct / train_total,
-                'lr': optimizer.param_groups[0]['lr']
-            })
-            
-            if batch_idx % 10 == 0:
-                torch.cuda.empty_cache()
-        
-        train_loss /= len(train_loader)
-        train_audio_loss /= len(train_loader)
-        train_text_loss /= len(train_loader)
-        train_acc = 100 * train_correct / train_total
-        train_audio_acc = 100 * train_audio_correct / train_total
-        train_text_acc = 100 * train_text_correct / train_total
-        
-        train_losses.append(train_loss)
-        train_accs.append(train_acc)
-        audio_losses['train'].append(train_audio_loss)
-        text_losses['train'].append(train_text_loss)
-        audio_accs['train'].append(train_audio_acc)
-        text_accs['train'].append(train_text_acc)
+        train_loss, train_acc, train_audio_acc, train_text_acc = train_epoch(
+            model, train_loader, optimizer, criterion, device, scheduler)
         
         # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_correct = 0
-        val_total = 0
-        val_audio_loss = 0.0
-        val_text_loss = 0.0
-        val_audio_correct = 0
-        val_text_correct = 0
-        all_predictions = []
-        all_labels = []
+        val_loss, val_acc, val_audio_acc, val_text_acc = validate(model, val_loader, criterion, device)
         
-        with torch.no_grad(), amp.autocast():
-            for batch in val_loader:
-                text_input_ids = batch['text_input_ids'].to(device, non_blocking=True)
-                text_attention_mask = batch['text_attention_mask'].to(device, non_blocking=True)
-                audio = batch['audio'].to(device, non_blocking=True)
-                labels = batch['label'].squeeze().to(device, non_blocking=True)
-                
-                outputs, text_logits, audio_logits = model(audio, text_input_ids, text_attention_mask)
-                total_loss = criterion(outputs, labels)
-                audio_loss = criterion(audio_logits, labels)
-                text_loss = criterion(text_logits, labels)
-                
-                val_loss += total_loss.item()
-                val_audio_loss += audio_loss.item()
-                val_text_loss += text_loss.item()
-                
-                _, predicted = torch.max(outputs.data, 1)
-                _, audio_predicted = torch.max(audio_logits.data, 1)
-                _, text_predicted = torch.max(text_logits.data, 1)
-                
-                val_total += labels.size(0)
-                val_correct += (predicted == labels).sum().item()
-                val_audio_correct += (audio_predicted == labels).sum().item()
-                val_text_correct += (text_predicted == labels).sum().item()
-                
-                all_predictions.extend(predicted.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
-        
-        val_loss /= len(val_loader)
-        val_audio_loss /= len(val_loader)
-        val_text_loss /= len(val_loader)
-        val_acc = 100 * val_correct / val_total
-        val_audio_acc = 100 * val_audio_correct / val_total
-        val_text_acc = 100 * val_text_correct / val_total
-        
+        train_losses.append(train_loss)
         val_losses.append(val_loss)
-        val_accs.append(val_acc)
-        audio_losses['val'].append(val_audio_loss)
-        text_losses['val'].append(val_text_loss)
-        audio_accs['val'].append(val_audio_acc)
-        text_accs['val'].append(val_text_acc)
         
-        # Record fusion weights
-        weights = model.get_fusion_weights()
-        fusion_weights.append([weights['audio_weight'], weights['text_weight']])
+        print(f'\nEpoch {epoch+1} Results:')
+        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+        print(f'Train Audio Acc: {train_audio_acc:.2f}%, Train Text Acc: {train_text_acc:.2f}%')
+        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        print(f'Val Audio Acc: {val_audio_acc:.2f}%, Val Text Acc: {val_text_acc:.2f}%')
         
-        print(f'\nEpoch {epoch+1}/{num_epochs}:')
-        print(f'Total - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'Total - Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
-        print(f'Audio - Train Loss: {train_audio_loss:.4f}, Train Acc: {train_audio_acc:.2f}%')
-        print(f'Audio - Val Loss: {val_audio_loss:.4f}, Val Acc: {val_audio_acc:.2f}%')
-        print(f'Text - Train Loss: {train_text_loss:.4f}, Train Acc: {train_text_acc:.2f}%')
-        print(f'Text - Val Loss: {val_text_loss:.4f}, Val Acc: {val_text_acc:.2f}%')
-        
-        # Early stopping check
-        if val_loss < best_val_loss - min_delta:
-            best_val_loss = val_loss
-            patience_counter = 0
+        # Early stopping with model saving
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            print(f'New best validation accuracy: {best_val_acc:.2f}%')
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'train_accs': train_accs,
-                'val_accs': val_accs,
-                'audio_losses': audio_losses,
-                'text_losses': text_losses,
-                'audio_accs': audio_accs,
-                'text_accs': text_accs,
-                'fusion_weights': np.array(fusion_weights)
-            }, 'best_decision_fusion_model.pth')
-            print(f"Decision fusion model saved with validation loss: {val_loss:.4f}")
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_val_acc': best_val_acc,
+            }, 'best_model.pth')
+            patience_counter = 0
         else:
             patience_counter += 1
-            print(f"Validation loss did not improve, patience: {patience_counter}/{early_stopping_patience}")
-            
-        if patience_counter >= early_stopping_patience:
-            print(f"Early stopping triggered! No improvement in validation loss for {early_stopping_patience} epochs")
-            break
+            if patience_counter >= PATIENCE:
+                print(f'\nEarly stopping triggered after {epoch+1} epochs')
+                # Load best model
+                checkpoint = torch.load('best_model.pth')
+                model.load_state_dict(checkpoint['model_state_dict'])
+                break
     
-    # Plot training metrics
-    plot_training_metrics(
-        train_losses, val_losses, 
-        train_accs, val_accs,
-        audio_losses, text_losses,
-        audio_accs, text_accs,
-        np.array(fusion_weights),
-        'training_metrics.png'
-    )
-    
-    # Output final evaluation report
-    print("\nFinal evaluation report:")
-    print(classification_report(
-        all_labels, 
-        all_predictions,
-        target_names=['Very Negative', 'Negative', 'Neutral', 'Positive', 'Very Positive']
-    ))
-    
-    # Plot confusion matrix
-    plt.figure(figsize=(10, 8))
-    cm = confusion_matrix(all_labels, all_predictions)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted')
-    plt.ylabel('True')
-    plt.savefig('confusion_matrix.png')
-    plt.close()
-    
-    return {
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'train_accs': train_accs,
-        'val_accs': val_accs,
-        'audio_losses': audio_losses,
-        'text_losses': text_losses,
-        'audio_accs': audio_accs,
-        'text_accs': text_accs,
-        'fusion_weights': np.array(fusion_weights)
-    }
+    return train_losses, val_losses
 
 def main():
     if not torch.cuda.is_available():
@@ -402,6 +465,12 @@ def main():
     
     device = torch.device("cuda")
     print(f'Using GPU: {torch.cuda.get_device_name(0)}')
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     
     # Create datasets
     data_dir = 'data/CMU_MOSEI/aligned'
@@ -421,31 +490,40 @@ def main():
         subset_ratio=subset_ratio
     )
     
-    # Create data loaders
+    # Create data loaders without multiprocessing on Windows
     train_loader = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=0,  # No multiprocessing on Windows
         pin_memory=True
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=32,
+        batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
+        num_workers=0,  # No multiprocessing on Windows
         pin_memory=True
     )
     
-    # Create model with correct input dimensions
+    # Create model
     model = DecisionFusionModel(
-        audio_input_dim=1,  # Single audio feature
+        audio_input_dim=74,
+        text_input_dim=300,
         hidden_dim=256,
         num_classes=5
     ).to(device)
     
+    # Print model architecture and parameter count
+    print('\nModel Architecture:')
+    print(model)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'\nTotal parameters: {total_params:,}')
+    print(f'Trainable parameters: {trainable_params:,}')
+    
     # Train model
-    print('Starting training...')
+    print('\nStarting training...')
     train(model, train_loader, val_loader, device)
 
 if __name__ == '__main__':
